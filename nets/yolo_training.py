@@ -13,6 +13,7 @@ class YOLOLoss(nn.Module):
         #-----------------------------------------------------------#
         self.anchors        = anchors
         self.num_classes    = num_classes
+        self.bUsedSmoothLabel=num_classes>1
         self.bbox_attrs     = 5 + num_classes
         self.input_shape    = input_shape
         self.anchors_mask   = anchors_mask
@@ -35,7 +36,61 @@ class YOLOLoss(nn.Module):
         pred    = self.clip_by_tensor(pred, epsilon, 1.0 - epsilon)
         output  = - target * torch.log(pred) - (1.0 - target) * torch.log(1.0 - pred)
         return output
-        
+
+    def box_diou(self, b1, b2):
+        '''
+        和ciou对比计算个diou,在nms计算交并比的时候也可以用到,很简单就去掉一个惩罚参数
+        :param b1:
+        :param b2:
+        :return:
+        '''
+        # ----------------------------------------------------#
+        #   求出预测框左上角右下角
+        # ----------------------------------------------------#
+        b1_xy = b1[..., :2]
+        b1_wh = b1[..., 2:4]
+        b1_wh_half = b1_wh / 2.
+        b1_mins = b1_xy - b1_wh_half
+        b1_maxes = b1_xy + b1_wh_half
+        # ----------------------------------------------------#
+        #   求出真实框左上角右下角
+        # ----------------------------------------------------#
+        b2_xy = b2[..., :2]
+        b2_wh = b2[..., 2:4]
+        b2_wh_half = b2_wh / 2.
+        b2_mins = b2_xy - b2_wh_half
+        b2_maxes = b2_xy + b2_wh_half
+
+        # ----------------------------------------------------#
+        #   求真实框和预测框所有的iou
+        # ----------------------------------------------------#
+        intersect_mins = torch.max(b1_mins, b2_mins)
+        intersect_maxes = torch.min(b1_maxes, b2_maxes)
+        intersect_wh = torch.max(intersect_maxes - intersect_mins, torch.zeros_like(intersect_maxes))
+        intersect_area = intersect_wh[..., 0] * intersect_wh[..., 1]
+        b1_area = b1_wh[..., 0] * b1_wh[..., 1]
+        b2_area = b2_wh[..., 0] * b2_wh[..., 1]
+        union_area = b1_area + b2_area - intersect_area
+        iou = intersect_area / torch.clamp(union_area, min=1e-6)
+
+        # ----------------------------------------------------#
+        #   计算中心的差距
+        # ----------------------------------------------------#
+        center_distance = torch.sum(torch.pow((b1_xy - b2_xy), 2), axis=-1)
+
+        # ----------------------------------------------------#
+        #   找到包裹两个框的最小框的左上角和右下角
+        # ----------------------------------------------------#
+        enclose_mins = torch.min(b1_mins, b2_mins)
+        enclose_maxes = torch.max(b1_maxes, b2_maxes)
+        enclose_wh = torch.max(enclose_maxes - enclose_mins, torch.zeros_like(intersect_maxes))
+        # ----------------------------------------------------#
+        #   计算对角线距离
+        # ----------------------------------------------------#
+        enclose_diagonal = torch.sum(torch.pow(enclose_wh, 2), axis=-1)
+        diou = iou - 1.0 * (center_distance) / torch.clamp(enclose_diagonal, min=1e-6)
+        return diou
+
     def box_ciou(self, b1, b2):
         """
         输入为：
@@ -195,8 +250,14 @@ class YOLOLoss(nn.Module):
         #-----------------------------------------------------------#
         loss_conf   = torch.sum(self.BCELoss(conf, y_true[..., 4]) * y_true[..., 4]) + \
                       torch.sum(self.BCELoss(conf, y_true[..., 4]) * noobj_mask)
+        if(self.bUsedSmoothLabel):
+            loss_cls = torch.sum(self.BCELoss(pred_cls[y_true[..., 4] == 1],
+                                              self.smooth_labels(y_true[..., 5:][y_true[..., 4] == 1],
+                                                                 self.label_smoothing, self.num_classes)))
+        else:
+            # 单分类预测不计算smooth,因为没有效果
+            loss_cls = torch.sum(self.BCELoss(pred_cls[y_true[..., 4] == 1], y_true[..., 5:][y_true[..., 4] == 1]))
 
-        loss_cls    = torch.sum(self.BCELoss(pred_cls[y_true[..., 4] == 1], self.smooth_labels(y_true[..., 5:][y_true[..., 4] == 1], self.label_smoothing, self.num_classes)))
 
         loss        = loss_loc + loss_conf + loss_cls
         num_pos = torch.sum(y_true[..., 4])

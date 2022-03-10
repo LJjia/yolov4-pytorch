@@ -4,12 +4,20 @@ import cv2
 import numpy as np
 from PIL import Image
 from torch.utils.data.dataset import Dataset
-
+import torch
 from utils.utils import cvtColor, preprocess_input
 
 
 class YoloDataset(Dataset):
     def __init__(self, annotation_lines, input_shape, num_classes, mosaic, train):
+        '''
+
+        :param annotation_lines: 图片path列表
+        :param input_shape: [416,416]
+        :param num_classes: 20
+        :param mosaic: 是否mosaic
+        :param train: 是否训练
+        '''
         super(YoloDataset, self).__init__()
         self.annotation_lines   = annotation_lines
         self.input_shape        = input_shape
@@ -29,6 +37,7 @@ class YoloDataset(Dataset):
         #---------------------------------------------------#
         if self.mosaic:
             if self.rand() < 0.5:
+                # 先随机取出三个图片,然后加上当前的图片
                 lines = sample(self.annotation_lines, 3)
                 lines.append(self.annotation_lines[index])
                 shuffle(lines)
@@ -47,8 +56,11 @@ class YoloDataset(Dataset):
             box[:, 0:2] = box[:, 0:2] + box[:, 2:4] / 2
         return image, box
 
-    def rand(self, a=0, b=1):
-        return np.random.rand()*(b-a) + a
+    def rand(self, a=0., b=1.):
+        # 使用torch的随机数加载
+        return torch.rand().item()*(b-a) + a
+        # 这里不使用np的随机数,因为多线程加载时,这些随机数每个线程可能相同
+        # return np.random.rand()*(b-a) + a
 
     def get_random_data(self, annotation_line, input_shape, jitter=.3, hue=.1, sat=1.5, val=1.5, random=True):
         line    = annotation_line.split()
@@ -109,6 +121,7 @@ class YoloDataset(Dataset):
         else:
             nw = int(scale*w)
             nh = int(nw/new_ar)
+        # 这么处理是有可能处理出大于图像边界416,416的图片的,但是后面会对框框进行处理
         image = image.resize((nw,nh), Image.BICUBIC)
 
         #------------------------------------------#
@@ -116,6 +129,8 @@ class YoloDataset(Dataset):
         #------------------------------------------#
         dx = int(self.rand(0, w-nw))
         dy = int(self.rand(0, h-nh))
+        # 也有可能缩放后的图片比较大,直接粘贴到了图像外围的左上角
+        # 没关系不会报错的
         new_image = Image.new('RGB', (w,h), (128,128,128))
         new_image.paste(image, (dx, dy))
         image = new_image
@@ -160,13 +175,25 @@ class YoloDataset(Dataset):
         
         return image_data, box
     
-    def merge_bboxes(self, bboxes, cutx, cuty):
+    def merge_bboxes(self, bboxes, cutx, cuty,threshold):
+        '''
+        将list的4个array打散,变成融合图的坐标
+        :param bboxes:list ,长度4,每个元素为array数组,[num_target,5]
+        :param cutx: 中间点位的x
+        :param cuty: 中间点位的y
+        :return:
+        '''
         merge_bbox = []
         for i in range(len(bboxes)):
             for box in bboxes[i]:
+                # 对每个target处理
                 tmp_box = []
                 x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
 
+                # 新增,过滤宽高小于最低阈值的框框
+                # 小于这个阈值连一个像素都不够,肯定无法预测
+                if (y2 - y1<=threshold) or (x2-x1<=threshold):
+                    continue
                 if i == 0:
                     if y1 > cuty or x1 > cutx:
                         continue
@@ -207,13 +234,29 @@ class YoloDataset(Dataset):
         return merge_bbox
 
     def get_random_data_with_Mosaic(self, annotation_line, input_shape, max_boxes=100, hue=.1, sat=1.5, val=1.5):
+        '''
+        将4张图融合成1张图
+        :param annotation_line:
+        :param input_shape:
+        :param max_boxes:
+        :param hue:
+        :param sat:
+        :param val:
+        :return:
+        '''
         h, w = input_shape
+        # 选取中心点
         min_offset_x = self.rand(0.25, 0.75)
         min_offset_y = self.rand(0.25, 0.75)
 
+        # 应该是生成每张图片缩放后的宽高
         nws     = [ int(w * self.rand(0.4, 1)), int(w * self.rand(0.4, 1)), int(w * self.rand(0.4, 1)), int(w * self.rand(0.4, 1))]
         nhs     = [ int(h * self.rand(0.4, 1)), int(h * self.rand(0.4, 1)), int(h * self.rand(0.4, 1)), int(h * self.rand(0.4, 1))]
-        
+
+        # 图片放置的左上角xy坐标 顺序为
+        # 1 4
+        # 2 3
+        # 注意palce_x和place_y都是像素单位的坐标
         place_x = [int(w*min_offset_x) - nws[0], int(w*min_offset_x) - nws[1], int(w*min_offset_x), int(w*min_offset_x)]
         place_y = [int(h*min_offset_y) - nhs[0], int(h*min_offset_y), int(h*min_offset_y), int(h*min_offset_y) - nhs[3]]
 
@@ -229,7 +272,7 @@ class YoloDataset(Dataset):
             
             # 图片的大小
             iw, ih = image.size
-            # 保存框的位置
+            # 保存框的位置 box似乎是个5维,最后一维为类别
             box = np.array([np.array(list(map(int,box.split(',')))) for box in line_content[1:]])
             
             # 是否翻转图片
@@ -261,10 +304,11 @@ class YoloDataset(Dataset):
                 box[:, 3][box[:, 3]>h] = h
                 box_w = box[:, 2] - box[:, 0]
                 box_h = box[:, 3] - box[:, 1]
+                # 删除框框宽高<1的,以及框框部分超过整张[416,416]图片的
                 box = box[np.logical_and(box_w>1, box_h>1)]
                 box_data = np.zeros((len(box),5))
                 box_data[:len(box)] = box
-            
+            # 每个image_data或box_data中存一个只有1/4的图片和位置信息?
             image_datas.append(image_data)
             box_datas.append(box_data)
 
@@ -272,7 +316,12 @@ class YoloDataset(Dataset):
         cutx = int(w * min_offset_x)
         cuty = int(h * min_offset_y)
 
+        # 这样申请出来的new_image竟然是float64数据,奇葩
         new_image = np.zeros([h, w, 3])
+        # 注意,因为从Image变为array的过程中,wh发生变换
+        # 如Image中是(w,h)
+        # array中则是(h,w,channel)
+        # 所以下面写的奇怪,是先取y轴,再取x轴
         new_image[:cuty, :cutx, :] = image_datas[0][:cuty, :cutx, :]
         new_image[cuty:, :cutx, :] = image_datas[1][cuty:, :cutx, :]
         new_image[cuty:, cutx:, :] = image_datas[2][cuty:, cutx:, :]
@@ -294,7 +343,13 @@ class YoloDataset(Dataset):
         new_image = cv2.cvtColor(x, cv2.COLOR_HSV2RGB)*255
 
         # 对框进行进一步的处理
-        new_boxes = self.merge_bboxes(box_datas, cutx, cuty)
+        # 再把图片重叠在其他区域的框框删除掉,以及将4个图片的框框融合成1个图片的
+        # 32是因为yolo默认的416的输入会缩放到13,26,52特征图是缩放到,会缩放到
+        # 分别对应原图上的32,16,8个像素
+        # 最小的为8,小于8个像素的目标可能经过切割,因此效果不好
+        # 标定没有意义
+        minest_size=8
+        new_boxes = self.merge_bboxes(box_datas, cutx, cuty,minest_size)
 
         return new_image, new_boxes
 

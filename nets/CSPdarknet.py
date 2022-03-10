@@ -40,6 +40,12 @@ class BasicConv(nn.Module):
 #---------------------------------------------------#
 class Resblock(nn.Module):
     def __init__(self, channels, hidden_channels=None):
+        '''
+        1x1基本卷积+3x3基本卷积
+        :param channels: 输出channel
+        :param hidden_channels: 第一个1x1卷积输出的隐藏层,
+        然后经过3x3卷积会输出对应的out_channel
+        '''
         super(Resblock, self).__init__()
 
         if hidden_channels is None:
@@ -69,6 +75,13 @@ class Resblock_body(nn.Module):
         self.downsample_conv = BasicConv(in_channels, out_channels, 3, stride=2)
 
         if first:
+            '''
+            因为第一个卷积输出为32channel,此时特征图数量较少
+            而经过3x3缩减特征图尺寸后,out_channel变成64
+            不适合做输入直接通过1x1卷积提取成两半 再分别卷积
+            所以第一个residual_body采用的方式是short和残差模块都输出out_channel(64)的形式,
+            然后堆叠成2*out_channel(128),再通过1x1卷积降维成最终输出64
+            '''
             #--------------------------------------------------------------------------#
             #   然后建立一个大的残差边self.split_conv0、这个大残差边绕过了很多的残差结构
             #--------------------------------------------------------------------------#
@@ -79,6 +92,7 @@ class Resblock_body(nn.Module):
             #----------------------------------------------------------------#
             self.split_conv1 = BasicConv(out_channels, out_channels, 1)  
             self.blocks_conv = nn.Sequential(
+                # 第一个residual模块也只重复一次
                 Resblock(channels=out_channels, hidden_channels=out_channels//2),
                 BasicConv(out_channels, out_channels, 1)
             )
@@ -95,10 +109,15 @@ class Resblock_body(nn.Module):
             #----------------------------------------------------------------#
             self.split_conv1 = BasicConv(out_channels, out_channels//2, 1)
             self.blocks_conv = nn.Sequential(
+                # num_blocks表示残差块的个数
+                # 这里的残差块并不像CSPNet或者densenet中的相互堆叠,越往后面channel越大
+                # 这里是越往后面,每层的channel尺度不变
                 *[Resblock(out_channels//2) for _ in range(num_blocks)],
+                # 串联完num_blocks个residual后,再来一个1x1卷积融合特征
                 BasicConv(out_channels//2, out_channels//2, 1)
             )
 
+            # 最后输出之前再来个1x1卷积,将concatenate的两层融合
             self.concat_conv = BasicConv(out_channels, out_channels, 1)
 
     def forward(self, x):
@@ -135,6 +154,7 @@ class CSPDarkNet(nn.Module):
 
         self.stages = nn.ModuleList([
             # 416,416,32 -> 208,208,64
+            # 仅第一个输出前的的1x1卷积是降维 128->64,其他输出前的1x1卷积都是直接同维度变换
             Resblock_body(self.inplanes, self.feature_channels[0], layers[0], first=True),
             # 208,208,64 -> 104,104,128
             Resblock_body(self.feature_channels[0], self.feature_channels[1], layers[1], first=False),
@@ -172,3 +192,13 @@ def darknet53(pretrained):
     if pretrained:
         model.load_state_dict(torch.load("model_data/CSPdarknet53_backbone_weights.pth"))
     return model
+
+
+if __name__ == '__main__':
+    from torch.utils.tensorboard import SummaryWriter
+
+    net=darknet53(pretrained=False)
+    data=torch.randn(1,3,416,416)
+    out=net(data)
+    with SummaryWriter(log_dir='./log', comment='cspdarknet') as writer:
+        writer.add_graph(net, data)
